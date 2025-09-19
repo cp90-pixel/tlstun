@@ -71,6 +71,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -194,6 +195,7 @@ hasServers:
 		cfg:      tlsConfig,
 		resolver: r,
 		addrs:    servers,
+		sslvpn:   args.SSLVPN,
 	}
 	ln, err := net.Listen("tcp", args.Addr)
 	if err != nil {
@@ -217,6 +219,7 @@ hasServers:
 type client struct {
 	cfg      *tls.Config
 	resolver *net.Resolver // nil for default system resolver
+	sslvpn   bool
 
 	mu    sync.Mutex
 	addrs []string
@@ -258,11 +261,42 @@ func (cl *client) dialAny() (net.Conn, error) {
 }
 
 func (cl *client) dial(addr string) (net.Conn, error) {
-	return tls.DialWithDialer(&net.Dialer{
+	conn, err := tls.DialWithDialer(&net.Dialer{
 		Timeout:   5 * time.Second,
 		KeepAlive: 3 * time.Minute,
 		Resolver:  cl.resolver,
 	}, "tcp", addr, cl.cfg)
+	if err != nil {
+		return nil, err
+	}
+	if !cl.sslvpn {
+		return conn, nil
+	}
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr, addr); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	rd := bufio.NewReader(conn)
+	line, err := rd.ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if !strings.HasPrefix(line, "HTTP/1.1 200") && !strings.HasPrefix(line, "HTTP/1.0 200") {
+		conn.Close()
+		return nil, fmt.Errorf("unexpected http response: %q", strings.TrimSpace(line))
+	}
+	for {
+		line, err = rd.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	return conn, nil
 }
 
 func (cl *client) promoteAddr(addr string) {
@@ -347,6 +381,7 @@ type clientArgs struct {
 	SystemCAs bool   `flag:"system-ca,allow server certificate be signed by one of the system CAs"`
 	DoT       bool   `flag:"dns-tls,use DNS-over-TLS (Cloudflare, Quad9, LibreDNS)"`
 	NoCheck   bool   `flag:"no-check,do not evaluate server health periodically to pick the best one"`
+	SSLVPN    bool   `flag:"sslvpn,connect to a standard SSL VPN server (HTTPS proxy)"`
 }
 
 func runServer(args serverArgs) error {
@@ -705,6 +740,9 @@ const usageClientTail = `
 Either non-empty server list or -discover=domain.tld flag must be set. Server
 addresses must be of host:port form. If -discover set to example.com, program
 will look up SRV record(s) _tlstun._tcp.example.com to get server list.
+
+If -sslvpn is set, client will attempt to establish tunnel by sending HTTP
+CONNECT request first. This is useful for connecting to standard HTTPS proxies.
 
 Either one of -system-ca, -ca=file.pem or both flags must be set.
 `
